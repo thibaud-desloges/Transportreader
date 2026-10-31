@@ -1,0 +1,142 @@
+//
+//  LineCorrections.swift
+//  TransportReader
+//
+
+import Foundation
+
+
+/// Les correspondances course → ligne que le référentiel donne fausses.
+///
+/// Le numéro de course qu'une carte annonce n'est publié nulle part : IDFM ne
+/// diffuse que son `privatecode`, qu'il partage parfois entre plusieurs lignes
+/// — cinquante codes pour cent dix-neuf lignes. La table livrée relie donc les
+/// deux par observation de vraies cartes, et cette observation se trompe
+/// parfois de prétendante.
+///
+/// Ces corrections vivent à part plutôt que retouchées dans `NavigoLines.json`,
+/// pour trois raisons. Un diff y montre ce qu'on surcharge et sur quelle foi,
+/// là où une retouche directe serait indiscernable de la donnée d'origine.
+/// Elles survivent à une régénération, que le script n'écrit jamais ici. Et
+/// leur prémisse se revérifie — `build_data.py corrections` alerte le jour où
+/// le référentiel se corrige en amont, pour que la surcharge s'efface au lieu
+/// de persister en silence.
+///
+/// Elles ne passent pas non plus par `ManualEntries` : ce journal est celui de
+/// l'utilisateur, effaçable d'un geste depuis les Réglages, et il ne doit pas
+/// porter ce que l'app livre — l'utilisateur corrige nos erreurs, il n'en
+/// hérite pas comme des siennes.
+struct LineCorrection: Decodable, Identifiable {
+    /// Ce que la carte annonce
+    let provider_id: Int
+    let line_id: Int
+    let mode: String
+
+    /// La ligne qu'il faut lire, et celle qu'elle déloge
+    let public_id: String
+    let remplace: String?
+
+    /// Quand la course a été observée, et ce qui fonde la correction
+    let constate: String?
+    let raison: String?
+    /// « validation observée » quand une carte l'a montrée, « relevé » quand
+    /// elle vient du terrain sans trace billettique. La nuance compte : la
+    /// première se rejoue, la seconde se croit.
+    let fonde_sur: String?
+
+    /// De quoi représenter la ligne quand elle manque à la table livrée : le
+    /// référentiel la publie, mais la génération l'a écartée — un code ponctué
+    /// de tirets suffit à l'exclure.
+    let name: String?
+    let background_color: String?
+    let text_color: String?
+
+    var id: String { "\(provider_id)|\(line_id)|\(mode)" }
+
+    /// Le jour du constat, quand il se laisse lire.
+    var jour: Date? {
+        constate.flatMap { Self.formatConstat.date(from: $0) }
+    }
+
+    private static let formatConstat: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter
+    }()
+}
+
+
+public class LineCorrections {
+    static let all: [LineCorrection] = DonneesLivrees.charger("LineCorrections", comme: [LineCorrection].self) ?? []
+
+    private static let index: [CleReseau: LineCorrection] = {
+        Dictionary(all.map { (cle($0.provider_id, $0.line_id, $0.mode), $0) },
+                   uniquingKeysWith: { first, _ in first })
+    }()
+
+    private static func cle(_ provider: Int, _ line_id: Int, _ mode: String) -> CleReseau {
+        CleReseau(exploitant: provider, numero: line_id, mode: mode)
+    }
+
+    /// Décode la table et bâtit son index.
+    static func prechauffer() {
+        _ = index
+    }
+
+    /// Rangées par exploitant, puis par course — comme le journal des saisies
+    /// se parcourt, et comme un réseau se lit.
+    static var parExploitant: [(providerId: Int, corrections: [LineCorrection])] {
+        var ordre: [Int] = []
+        var groupes: [Int: [LineCorrection]] = [:]
+        for correction in all {
+            if groupes[correction.provider_id] == nil { ordre.append(correction.provider_id) }
+            groupes[correction.provider_id, default: []].append(correction)
+        }
+        return ordre
+            .sorted { interpretServiceProviderShortName($0)
+                        .localizedStandardCompare(interpretServiceProviderShortName($1)) == .orderedAscending }
+            .map { ($0, (groupes[$0] ?? []).sorted { $0.line_id < $1.line_id }) }
+    }
+
+    /// La ligne corrigée pour cette course, quand il y en a une.
+    ///
+    /// Le nom et les couleurs viennent du référentiel — c'est bien lui qui
+    /// décrit la ligne, seul son rattachement à la course était faux. Mais
+    /// l'exploitant et la course redeviennent ceux que la carte annonce : la
+    /// ligne visée n'est parfois déclarée que sous ses anciens exploitants,
+    /// d'avant les délégations, et la laisser sous ceux-là brouillerait tout
+    /// rapprochement avec l'arrêt.
+    static func corrected(_ provider: Int, _ line_id: Int, _ mode: String,
+                          parmi lignes: [NavigoLineInfo]) -> NavigoLineInfo? {
+        guard let correction = index[cle(provider, line_id, mode)] else { return nil }
+
+        if let ligne = lignes.first(where: { $0.public_id == correction.public_id }) {
+            return NavigoLineInfo(name: ligne.name,
+                                  mode: ligne.mode,
+                                  direction: ligne.direction,
+                                  public_id: ligne.public_id,
+                                  provider_id: provider,
+                                  line_id: line_id,
+                                  background_color: ligne.background_color,
+                                  text_color: ligne.text_color,
+                                  is_noctilien: ligne.is_noctilien)
+        }
+
+        // La ligne manque à la table : la correction la porte elle-même.
+        guard let name = correction.name else { return nil }
+        return NavigoLineInfo(name: name,
+                              mode: mode,
+                              public_id: correction.public_id,
+                              provider_id: provider,
+                              line_id: line_id,
+                              background_color: correction.background_color ?? LineEntry.defaultBackground,
+                              text_color: correction.text_color ?? LineEntry.defaultText)
+    }
+
+    /// La ligne que désigne une correction, pour l'écran qui les donne à lire.
+    static func ligne(_ correction: LineCorrection) -> NavigoLineInfo? {
+        corrected(correction.provider_id, correction.line_id, correction.mode,
+                  parmi: NavigoLines.allLines)
+    }
+}

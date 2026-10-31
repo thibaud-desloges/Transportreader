@@ -1,0 +1,324 @@
+//
+//  Navigo.swift
+//  TransportReader
+//
+//  Created by Antoine Souben-Fink on 07/02/2025.
+//
+
+import Foundation
+
+
+func interpretNavigoCommercialId(_ bitstring: String) -> String {
+    // À trouver : Navigo Découverte, eSE Android (ou eq)
+    switch Int(bitstring, radix: 2) ?? 0 {
+    case 0:
+        return "Unknown"
+    case 1:
+        return "Navigo" // Ou Navigo Découverte
+    case 2:
+        return "Navigo Annuel"
+    case 5:
+        return "Navigo Imagine R"
+    case 10:
+        return "eSE Apple"
+    case 16:
+        return "Navigo Easy Carte"
+    case 17:
+        return "Navigo Easy SOCS"
+    case 32:
+        return "Carte Interne"
+    default:
+        return "Unknown (\(Int(bitstring, radix: 2) ?? 0))"
+    }
+}
+
+func interpretNavigoImage(_ personalizationStatusBitstring: String, _ issuerIdBitstring: String, _ commercialIdBitString: String, _ contracts: [[String: Any]]) -> String {
+    let (perso, _, _) = interpretPersonalizationStatusCode(personalizationStatusBitstring)
+    let commercialName = interpretNavigoCommercialId(commercialIdBitString)
+    let issuer = interpretServiceProvider(issuerIdBitstring)
+    
+    for contractInfo in contracts {
+        if let tariffBitstring = getKey(contractInfo, "ContractTariff") {
+            let tariff = Int(tariffBitstring, radix: 2)
+            if tariff == 0x000E {
+                if let endDateBitstring = getKey(contractInfo, "ContractValidityEndDate") {
+                    let endDate = interpretDate(endDateBitstring)
+                    switch endDate {
+                    case "14/08/2024":
+                        return "PhrygeJO"
+                    case "11/09/2024":
+                        return "PhrygeJOP"
+                    default:
+                        return "PhrygeJO"
+                    }
+                }
+            } else if tariff == 0x8010 {
+                return "Pass Local"
+            }
+        }
+    }
+    
+    switch commercialName {
+    case "Navigo", "Navigo Annuel", "Navigo Imagine R":
+        return "Nominatif"
+    case "eSE Apple":
+        return "Pass iOS"
+    case "Carte Interne":
+        switch issuer {
+        case "SNCF":
+            return "Carmillon"
+        case "Optile":
+            return "Optile"
+        default:
+            return "Nominatif"
+        }
+    case "Navigo Easy Carte":
+        return "Easy"
+    case "Navigo Easy SOCS": // Support Occasionnel Carton Sans Contact
+        return "EasyCarton"
+    default:
+        switch perso {
+        case "Anonymous":
+            return "Easy"
+        case "Declarative":
+            return "Découverte"
+        case "Nominative":
+            return "Nominatif"
+        default:
+            return "Nominatif"
+        }
+    }
+}
+
+func interpretNavigoPersonalizationStatusCode(_ bitstring: String) -> String {
+    let (perso, integral, imaginer) = interpretPersonalizationStatusCode(bitstring)
+    
+    switch perso {
+    case "Anonymous":
+        return "Navigo Easy"
+    case "Declarative":
+        return "Navigo Découverte"
+    case "Nominative":
+        if integral {
+            if imaginer {
+                return "Navigo Imagine R"
+            }
+            return "Navigo Annuel"
+        }
+        return "Navigo"
+    default:
+        return "Navigo Unknown"
+    }
+}
+
+func interpretTariff(_ bitstring: String, _ contractEndDateBitstring: String) -> String {
+    let code = Int(bitstring, radix: 2) ?? 0
+    guard let tariff = TariffCatalog.find(code) else {
+        return "Unknown (\(code))"
+    }
+    return tariff.name(endDate: interpretDate(contractEndDateBitstring))
+}
+
+func interpretTariffDuration(_ bitstring: String) -> TimeInterval {
+    let code = Int(bitstring, radix: 2) ?? 0
+    return TariffCatalog.find(code)?.duration ?? TariffCatalog.defaultDuration
+}
+
+/// Les zones couvertes par un titre, telles que le bitstring les porte : un bit
+/// par zone, la première à droite.
+func interpretZoneSet(_ bitstring: String) -> Set<Int> {
+    var zones: Set<Int> = []
+    for (i, char) in bitstring.reversed().enumerated() where char == "1" {
+        zones.insert(i + 1)
+    }
+    return zones
+}
+
+func interpretZonesShort(_ bitstring: String) -> String {
+    /**
+     Interprets the zone information from a binary string.
+     - Parameter bitstring: The binary string representing zones.
+     - Returns: A string describing the interpreted zones.
+     */
+    
+    let zones = interpretZoneSet(bitstring)
+    
+    guard let minZone = zones.min(), let maxZone = zones.max() else {
+        return "-"
+    }
+    
+    if minZone == maxZone {
+        return "\(minZone)"
+    }
+    
+    return "\(minZone)-\(maxZone)"
+}
+
+/// Les lignes que ce numéro de course peut désigner, la retenue en tête.
+///
+/// Presque toujours une seule. Mais le référentiel partage parfois un
+/// `privatecode` entre plusieurs lignes, et rien sur la carte ne les
+/// départage : on rend alors tout le paquet plutôt que d'en élire une.
+func interpretRouteCandidates(_ routeNumberBitstring: String, _ eventCodeBitstring: String, _ eventServiceProviderBitstring: String) -> [NavigoLineInfo] {
+    guard let routeNumber = Int(routeNumberBitstring, radix: 2) else {
+        return []
+    }
+    
+    let serviceProviderCode = Int(eventServiceProviderBitstring, radix: 2) ?? 0
+
+    let eventTransport = interpretEventCode(eventCodeBitstring, isRouteNumberPresent: true, routeNumber: routeNumber, serviceProvider: serviceProviderCode).0
+    
+    if let saisie = ManualEntries.shared.line(provider: serviceProviderCode, route: routeNumber, mode: eventTransport) {
+        return [saisie]
+    }
+    
+    if (eventTransport == "RER") {
+        if (routeNumber == 16) || (routeNumber == 17) || (routeNumber == 26) {
+            return [NavigoLineInfo(name: "A", mode: "RER", public_id: "C01742", provider_id: 3, line_id: 16, background_color: "eb2132", text_color: "ffffff", is_noctilien: false)]
+        }
+        else if routeNumber == 18 {
+            return [NavigoLineInfo(name: "B", mode: "RER", public_id: "C01743", provider_id: 3, line_id: 18, background_color: "5091cb", text_color: "ffffff", is_noctilien: false)]
+        }
+    }
+    else if (eventTransport == "Métro" && routeNumber == 29) {
+        return [NavigoLineInfo(name: "Orlyval", mode: "Métro", public_id: "C01388", provider_id: 4, line_id: 29, background_color: "5ec5ed", text_color: "ffffff", is_noctilien: false)]
+    }
+    else {
+        let trouvees = NavigoLines.candidates(serviceProviderCode, routeNumber, eventTransport)
+        if !trouvees.isEmpty {
+            return trouvees.map { ligne in
+                var route = ligne
+                if route.is_noctilien {
+                    route.mode = "Noctilien"
+                }
+                return route
+            }
+        }
+    }
+    
+    // Ni référentiel ni saisie : on rend le numéro de course brut, et on le dit.
+    return [NavigoLineInfo(name: "\(routeNumber)", mode: eventTransport, public_id: "UNK\(routeNumber)", provider_id: serviceProviderCode, line_id: routeNumber, background_color: LineEntry.defaultBackground, text_color: LineEntry.defaultText, is_noctilien: false, found: false)]
+}
+
+/// D'où viennent les lignes de `interpretRouteCandidates` : le même chemin,
+/// dans le même ordre, dit plutôt que suivi.
+func provenanceLigne(_ routeNumberBitstring: String, _ eventCodeBitstring: String, _ eventServiceProviderBitstring: String) -> String {
+    guard let routeNumber = Int(routeNumberBitstring, radix: 2) else { return "Pas de numéro de course" }
+    let serviceProviderCode = Int(eventServiceProviderBitstring, radix: 2) ?? 0
+    let eventTransport = interpretEventCode(eventCodeBitstring, isRouteNumberPresent: true, routeNumber: routeNumber, serviceProvider: serviceProviderCode).0
+
+    if ManualEntries.shared.line(provider: serviceProviderCode, route: routeNumber, mode: eventTransport) != nil {
+        return "Données saisies"
+    }
+    if eventTransport == "RER" {
+        if [16, 17, 26].contains(routeNumber) { return "Règle de l'app : RER A" }
+        if routeNumber == 18 { return "Règle de l'app : RER B" }
+    } else if eventTransport == "Métro" && routeNumber == 29 {
+        return "Règle de l'app : Orlyval"
+    } else if let source = NavigoLines.provenance(serviceProviderCode, routeNumber, eventTransport) {
+        return source
+    }
+    return "Aucune : le numéro de course brut"
+}
+
+func interpretServiceProvider(_ bitstring: String) -> String {
+    interpretServiceProviderName(Int(bitstring, radix: 2) ?? 0)
+}
+
+/// Le libellé d'exploitant, sans passer par le bitstring. Le référentiel
+/// d'abord, puis ce que l'utilisateur a saisi pour les exploitants qui n'y
+/// figurent pas.
+func interpretServiceProviderName(_ id: Int) -> String {
+    ProviderCatalog.findProvider(id)?.displayName
+        ?? ManualEntries.shared.providerName(id)
+        ?? "Unknown (\(id))"
+}
+
+/// Le nom court d'un exploitant : celui de son réseau, ou son libellé s'il n'en
+/// a pas. Le libellé complet — réseau, exploitant et numéro de lot — ne tient
+/// pas sur la ligne d'une liste.
+func interpretServiceProviderShortName(_ id: Int) -> String {
+    ProviderCatalog.findProvider(id)?.nomCourt
+        ?? ManualEntries.shared.provider(id)?.nomCourt
+        ?? "Exploitant \(id)"
+}
+
+/// Ce que le nom court laisse de côté : l'exploitant et son numéro de lot.
+/// Nil pour ce qui n'est pas une délégation — SNCF, RATP.
+func interpretServiceProviderDetail(_ id: Int) -> String? {
+    ProviderCatalog.findProvider(id)?.detail ?? ManualEntries.shared.provider(id)?.detail
+}
+
+/// Vrai quand le nom affiché vient du journal et non du référentiel. Une
+/// saisie que le référentiel a fini par rattraper est masquée par lui : la
+/// signaler comme saisie ferait mentir la pastille.
+func isServiceProviderNamedByHand(_ id: Int) -> Bool {
+    ProviderCatalog.findProvider(id) == nil && ManualEntries.shared.provider(id) != nil
+}
+
+/// Vrai quand ni le référentiel ni le journal ne savent nommer cet exploitant.
+func isServiceProviderUnknown(_ id: Int) -> Bool {
+    ProviderCatalog.findProvider(id) == nil && ManualEntries.shared.provider(id) == nil
+}
+
+/// D'où vient le libellé de `interpretServiceProviderName`.
+func provenanceReseau(_ id: Int) -> String {
+    if ProviderCatalog.findProvider(id) != nil { return "Référentiel" }
+    if ManualEntries.shared.providerName(id) != nil { return "Données saisies" }
+    return "Aucune : le numéro brut"
+}
+
+func interpretLocationId(_ locationIdBitString: String, _ eventCodeBitstring: String, _ eventServiceProviderBitstring: String, _ routeNumberBitstring: String?) -> NavigoStationInfo {
+    guard let value = Int(locationIdBitString, radix: 2) else {
+        return NavigoStationInfo.init(name: "Unknown (\(locationIdBitString))", provider_id: 0, line_id: nil, location_id: 0, mode: "Unknown", lat: 0, lon: 0, found: false)
+    }
+    
+    let eventRouteNumberPresent = (routeNumberBitstring != nil)
+    // La course annoncée : elle désigne la ligne, et sur un bus ou un tram
+    // c'est la ligne qui donne son sens au code d'arrêt.
+    let routeNumber = eventRouteNumberPresent ? Int(routeNumberBitstring ?? "", radix: 2) : nil
+
+    let eventTransport = interpretEventCode(eventCodeBitstring, isRouteNumberPresent: eventRouteNumberPresent, routeNumber: routeNumber, serviceProvider: Int(eventServiceProviderBitstring, radix: 2)).0
+    
+    let eventServiceProviderId = Int(eventServiceProviderBitstring, radix: 2) ?? 0
+
+    guard let station = NavigoStations.find(eventServiceProviderId, routeNumber, value, eventTransport) else {
+        // Faute de référentiel, l'arrêt a pu être identifié à la main
+        if let signale = ManualEntries.shared.station(provider: eventServiceProviderId, location: value,
+                                                      mode: eventTransport, route: routeNumber) {
+            return signale
+        }
+        // Ou venir de l'exploitant lui-même, quand il nous a transmis ce qu'il
+        // n'a jamais déclaré au référentiel. La saisie de l'utilisateur passe
+        // devant : c'est lui qui corrige ce qu'on livre, pas l'inverse.
+        if let livre = StopCorrections.find(eventServiceProviderId, value, eventTransport) {
+            return livre
+        }
+        return NavigoStationInfo.init(name: "\(value)", provider_id: eventServiceProviderId, line_id: nil, location_id: value, mode: eventTransport, lat: 0, lon: 0, found: false)
+    }
+    return station
+}
+
+/// D'où vient l'arrêt de `interpretLocationId` : le même chemin, dans le même
+/// ordre — référentiel, saisie, correction livrée.
+func provenanceArret(_ locationIdBitString: String, _ eventCodeBitstring: String, _ eventServiceProviderBitstring: String, _ routeNumberBitstring: String?) -> String {
+    guard let value = Int(locationIdBitString, radix: 2) else { return "Pas de code de lieu" }
+
+    let eventRouteNumberPresent = (routeNumberBitstring != nil)
+    let routeNumber = eventRouteNumberPresent ? Int(routeNumberBitstring ?? "", radix: 2) : nil
+    let eventTransport = interpretEventCode(eventCodeBitstring, isRouteNumberPresent: eventRouteNumberPresent, routeNumber: routeNumber, serviceProvider: Int(eventServiceProviderBitstring, radix: 2)).0
+    let eventServiceProviderId = Int(eventServiceProviderBitstring, radix: 2) ?? 0
+
+    if NavigoStations.find(eventServiceProviderId, routeNumber, value, eventTransport) != nil {
+        return "Référentiel"
+    }
+    if ManualEntries.shared.station(provider: eventServiceProviderId, location: value,
+                                    mode: eventTransport, route: routeNumber) != nil {
+        return "Données saisies"
+    }
+    if StopCorrections.find(eventServiceProviderId, value, eventTransport) != nil {
+        return "Correction livrée"
+    }
+    return "Aucune : le code brut"
+}
+

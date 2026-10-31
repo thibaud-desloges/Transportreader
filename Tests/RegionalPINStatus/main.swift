@@ -1,0 +1,22 @@
+import Foundation
+precondition(RegionalPINStatus.commandData.isEmpty)
+precondition(RegionalPINStatus.classByte(for: "334D54522E494341") == 0x94)
+precondition(RegionalPINStatus.classByte(for: "A0000004044125092001") == 0)
+precondition(RegionalPINStatus.instruction == 0x20)
+precondition(RegionalPINStatus.label(statusWord: "9000").contains("3 essais"))
+precondition(RegionalPINStatus.label(statusWord: "9000").contains("réponse 9000"))
+precondition(RegionalPINStatus.label(statusWord: "9000").contains("décodage Calypso"))
+precondition(RegionalPINStatus.label(statusWord: "63C2").contains("2 essais"))
+precondition(RegionalPINStatus.label(statusWord: "6983").contains("bloqué"))
+precondition(RegionalPINStatus.label(statusWord: "6D00").contains("non prise en charge"))
+var cursor = RegionalScanPlan.Cursor(applications: ["334D54522E494341", "A0000004044125092001"], cardIdentifier: "test")
+cursor.pinStatus = true
+precondition(cursor.locations.count == 1 && cursor.locations[0].path == [0, 3])
+cursor.pinStatusRead = true
+let restored = try JSONDecoder().decode(RegionalScanPlan.Cursor.self, from: JSONEncoder().encode(cursor))
+precondition(restored == cursor)
+cursor.nextLocation()
+precondition(cursor.application == 1 && cursor.pinStatusRead == nil)
+precondition(cursor.locations.count == 1 && cursor.locations[0].path == [0x23, 0, 0x23, 2])
+cursor.nextLocation();precondition(cursor.finished)
+print("PIN inquiry: empty command data, status decoding and targeted resume checks passed")

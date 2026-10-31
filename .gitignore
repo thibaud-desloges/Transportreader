@@ -1,0 +1,24 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# macOS
+.DS_Store
+__pycache__/
+*.pyc
+
+# Documents de travail
+PRIVACY.txt
+
+# Notes de travail
+NOTES-*.md
+# Sauf celle-ci : des codes du référentiel ne se justifient que par elle, et
+# la réserve sur ce qui y est déduit plutôt que mesuré doit suivre le code.
+!NOTES-CODES-ARRETS.md

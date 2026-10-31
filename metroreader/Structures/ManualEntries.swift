@@ -1,0 +1,589 @@
+//
+//  ManualEntries.swift
+//  TransportReader
+//
+
+import Foundation
+import SwiftUI
+import UniformTypeIdentifiers
+
+
+// MARK: - Ce que la carte annonce sans que le référentiel sache le nommer
+
+/// Un exploitant que la carte désigne par un numéro auquel aucun libellé ne
+/// répond. Les champs reprennent ceux de `ServiceProviderInfo` pour que la
+/// saisie se verse telle quelle dans `Data/Providers.json`.
+struct ProviderEntry: Identifiable, Codable, Equatable {
+    let id: UUID
+    var date: Date
+    let providerId: Int
+
+    var network: String?      // Nom du réseau, tel qu'IDFM le publie
+    var operatorName: String? // Société exploitante
+    var dsp: Int?             // Numéro de lot de la délégation de service public
+    var name: String?         // Libellé libre, pour les exploitants hors DSP
+
+    enum CodingKeys: String, CodingKey {
+        case id, date, providerId, network, dsp, name
+        case operatorName = "operator"
+    }
+
+    /// Même règle d'affichage que le catalogue, pour qu'une saisie se lise
+    /// comme une entrée du référentiel.
+    var displayName: String {
+        libelleDeDelegation ?? name?.nilIfEmpty ?? "Exploitant \(providerId)"
+    }
+}
+
+
+/// Une ligne que la carte désigne par un numéro de course dont aucune ligne du
+/// référentiel ne porte le nom, pour cet exploitant et ce mode.
+struct LineEntry: Identifiable, Codable, Equatable {
+    let id: UUID
+    var date: Date
+
+    // Ce que la carte annonce
+    let providerId: Int
+    let routeNumber: Int
+    let mode: String
+
+    // Ce que l'utilisateur a identifié
+    var name: String
+    var publicId: String?      // identifiant IDFM, si la ligne a été prise dans la liste
+    var backgroundColor: String
+    var textColor: String
+
+    static let defaultBackground = "c5c5c5"
+    static let defaultText = "000000"
+
+    var lineInfo: NavigoLineInfo {
+        NavigoLineInfo(name: name, mode: mode,
+                       public_id: publicId ?? "UNK\(routeNumber)",
+                       provider_id: providerId, line_id: routeNumber,
+                       background_color: backgroundColor, text_color: textColor)
+    }
+}
+
+
+/// Un arrêt que l'app n'a pas su nommer, et que l'utilisateur a identifié.
+///
+/// Treize délégations n'ont pas déclaré leurs codes billettiques au référentiel
+/// IDFM : leurs arrêts existent avec nom et coordonnées, mais sont indexés sur
+/// un identifiant que les cartes ne portent pas. Le journal recueille les
+/// correspondances constatées sur le terrain, en attendant que la source soit
+/// corrigée en amont.
+struct StopReport: Identifiable, Codable, Equatable {
+    let id: UUID
+    var date: Date
+
+    // Ce que la carte annonce
+    let providerId: Int
+    let locationId: Int
+    let mode: String
+    var routeNumber: Int?
+    var lineName: String?
+
+    // Ce que l'utilisateur a identifié
+    var stationName: String
+    var referenceId: Int? // identifiant IDFM de l'arrêt choisi, si pris dans la liste
+    var lat: Double?
+    var lon: Double?
+
+    var hasCoordinates: Bool { lat != nil && lon != nil }
+}
+
+
+/// Une validation dont l'arrêt ne vaut rien.
+///
+/// Le valideur d'un bus annonce l'arrêt qu'on lui a réglé, pas celui où le bus
+/// se trouve : mal réglé, il en donne un autre. Le code n'est pas faux pour
+/// autant — sur les autres validations, il désigne bien cet arrêt —, alors
+/// c'est cette validation seule qu'on écarte.
+struct IgnoredStop: Identifiable, Codable, Equatable {
+    let id: UUID
+    var date: Date
+    let validation: CleValidation
+}
+
+/// Une validation telle que la carte l'écrit : son jour, sa minute, son
+/// valideur, et l'arrêt qu'il annonce. La carte ne réécrit pas ce qu'elle a
+/// enregistré : chaque lecture la retrouve.
+struct CleValidation: Codable, Hashable {
+    let dateStamp: Int
+    let timeStamp: Int?
+    let device: Int?
+    let providerId: Int
+    let locationId: Int
+
+    init?(_ eventInfo: [String: Any]) {
+        func entier(_ cle: String) -> Int? { getKey(eventInfo, cle).flatMap { Int($0, radix: 2) } }
+        guard let jour = entier("EventDateStamp"), let arret = entier("EventLocationId") else { return nil }
+        dateStamp = jour
+        timeStamp = entier("EventTimeStamp")
+        device = entier("EventDevice")
+        providerId = entier("EventServiceProvider") ?? 0
+        locationId = arret
+    }
+}
+
+
+// MARK: - Le journal
+
+/// Ce que l'utilisateur a saisi faute de référentiel.
+///
+/// Trois objets manquent aux jeux de données publics, et pour la même raison :
+/// des exploitants n'ont pas déclaré leur codification. Il leur manque un
+/// libellé d'exploitant, un nom de ligne, ou la correspondance entre un code
+/// d'arrêt et un arrêt réel. Les trois se saisissent depuis l'écran d'un
+/// événement, se relisent dans Réglages › Données, et s'exportent de là pour
+/// être versés au jeu de données.
+final class ManualEntries: ObservableObject {
+    static let shared = ManualEntries(dossier: Persistance.documents)
+
+    @Published private(set) var providers: [ProviderEntry] = []
+    @Published private(set) var lines: [LineEntry] = []
+    @Published private(set) var stops: [StopReport] = []
+    /// Les validations dont l'arrêt est écarté. Ce n'est pas de la donnée pour
+    /// le référentiel : elles ne partent pas à l'export.
+    @Published private(set) var ignoredStops: [IgnoredStop] = []
+
+    /// Change à chaque modification du journal, quelle qu'elle soit : un
+    /// renommage ne change pas le nombre de saisies.
+    @Published private(set) var revision = 0
+
+    // Le nom du fichier des arrêts est celui des versions précédentes : les
+    // journaux déjà constitués se relisent sans migration.
+    private let stopsURL: URL
+    private let linesURL: URL
+    private let providersURL: URL
+    private let ignoredStopsURL: URL
+
+    // Faux pour un fichier qui existait sans pouvoir être ni relu ni mis de
+    // côté : l'écraser détruirait ce qu'il est seul à contenir.
+    private var stopsEcrasables = true
+    private var linesEcrasables = true
+    private var providersEcrasables = true
+    private var ignoredStopsEcrasables = true
+
+    /// Plusieurs saisies peuvent partager une clé : le même code, sur deux
+    /// lignes du même réseau, ne désigne pas le même arrêt.
+    private var stopIndex: [CleReseau: [StopReport]] = [:]
+    private var lineIndex: [CleReseau: LineEntry] = [:]
+    private var providerIndex: [Int: ProviderEntry] = [:]
+    private var ignoredIndex = Set<CleValidation>()
+
+    /// Le dossier n'est un paramètre que pour les essais : l'app n'en a qu'un.
+    init(dossier: URL) {
+        stopsURL = dossier.appendingPathComponent("stopreports.json")
+        linesURL = dossier.appendingPathComponent("manual-lines.json")
+        providersURL = dossier.appendingPathComponent("manual-providers.json")
+        ignoredStopsURL = dossier.appendingPathComponent("ignored-stops.json")
+        let arrets: Persistance.Lecture<StopReport> = Persistance.lire(stopsURL, decodeur: .iso)
+        let lignes: Persistance.Lecture<LineEntry> = Persistance.lire(linesURL, decodeur: .iso)
+        let reseaux: Persistance.Lecture<ProviderEntry> = Persistance.lire(providersURL, decodeur: .iso)
+        let ecartes: Persistance.Lecture<IgnoredStop> = Persistance.lire(ignoredStopsURL, decodeur: .iso)
+        stopsEcrasables = arrets.ecrasable
+        linesEcrasables = lignes.ecrasable
+        providersEcrasables = reseaux.ecrasable
+        ignoredStopsEcrasables = ecartes.ecrasable
+        stops = arrets.valeurs
+        lines = lignes.valeurs
+        providers = reseaux.valeurs
+        ignoredStops = ecartes.valeurs
+        rebuild()
+    }
+
+    // MARK: Consultation
+
+    private static func stopKey(_ provider: Int, _ location: Int, _ mode: String) -> CleReseau {
+        CleReseau(exploitant: provider, numero: location, mode: mode)
+    }
+
+    private static func lineKey(_ provider: Int, _ route: Int, _ mode: String) -> CleReseau {
+        CleReseau(exploitant: provider, numero: route, mode: mode)
+    }
+
+    /// L'arrêt identifié pour ce couple. Dix des treize réseaux concernés n'ont
+    /// aucun arrêt en base : leur nom ne peut être que saisi au clavier, sans
+    /// coordonnées. Il s'affiche quand même — c'est isLocatable, et non found,
+    /// qui décide de la mise en carte.
+    func station(provider: Int, location: Int, mode: String, route: Int?) -> NavigoStationInfo? {
+        guard let r = stopReport(provider: provider, location: location, mode: mode, route: route) else { return nil }
+        return NavigoStationInfo(name: r.stationName, provider_id: provider, line_id: nil,
+                                 location_id: location, mode: mode,
+                                 lat: r.lat ?? 0, lon: r.lon ?? 0)
+    }
+
+    func lineEntry(provider: Int, route: Int, mode: String) -> LineEntry? {
+        lineIndex[Self.lineKey(provider, route, mode)]
+    }
+
+    func line(provider: Int, route: Int, mode: String) -> NavigoLineInfo? {
+        lineEntry(provider: provider, route: route, mode: mode)?.lineInfo
+    }
+
+    func provider(_ id: Int) -> ProviderEntry? { providerIndex[id] }
+
+    func providerName(_ id: Int) -> String? { providerIndex[id]?.displayName }
+
+    /// La saisie rangée pour ce couple, que le référentiel la masque ou non.
+    ///
+    /// Sur un bus ou un tram, elle doit venir de la course annoncée : le code
+    /// y est un numéro de séquence le long d'une ligne, pas un identifiant
+    /// d'arrêt sur le réseau. Le 12 de la 197 est Rue du 8 Mai 1945 à
+    /// Bourg-la-Reine ; le 12 de la 299 est Porte d'Orléans. Rangée par le seul
+    /// exploitant, la première saisie nommait la seconde validation.
+    func stopReport(provider: Int, location: Int, mode: String, route: Int?) -> StopReport? {
+        let saisies = stopIndex[Self.stopKey(provider, location, mode)] ?? []
+        guard NavigoStations.numeroteParLigne(mode) else { return saisies.first }
+        return saisies.first { Self.memeCourse($0.routeNumber, route, provider, mode) }
+    }
+
+    /// Deux numéros de course désignent-ils la même ligne ?
+    ///
+    /// Par l'identifiant IDFM quand le référentiel les connaît : une même ligne
+    /// s'y annonce sous plusieurs numéros, et la carte loge parfois la course
+    /// dans l'octet haut. Par le nombre à défaut. Une saisie sans course ne
+    /// vaut pour aucune : on ne sait pas d'où elle vient.
+    private static func memeCourse(_ saisie: Int?, _ annoncee: Int?, _ provider: Int, _ mode: String) -> Bool {
+        guard let saisie, let annoncee else { return false }
+        if saisie == annoncee { return true }
+        let siennes = Set(NavigoLines.candidates(provider, saisie, mode).map(\.public_id))
+        guard !siennes.isEmpty else { return false }
+        return NavigoLines.candidates(provider, annoncee, mode).contains { siennes.contains($0.public_id) }
+    }
+
+    /// Vrai quand l'arrêt de cette validation a été écarté. Chaque ligne de
+    /// liste le demande à chaque rendu : sans rien d'écarté, rien à lire.
+    func isStopIgnored(_ eventInfo: [String: Any]) -> Bool {
+        guard !ignoredIndex.isEmpty, let cle = CleValidation(eventInfo) else { return false }
+        return ignoredIndex.contains(cle)
+    }
+
+    // MARK: L'arborescence
+
+    /// Le journal se lit comme le réseau se parcourt : un exploitant, ses
+    /// lignes, et les arrêts de chaque ligne. Les trois journaux sont cousus
+    /// ensemble ici — une ligne peut n'exister que par les arrêts qui la citent,
+    /// un réseau que par une ligne qu'on lui a nommée.
+    var networks: [ManualNetwork] {
+        var ordre: [Int] = []
+        var vus = Set<Int>()
+        for id in providers.map(\.providerId) + lines.map(\.providerId) + stops.map(\.providerId)
+        where vus.insert(id).inserted {
+            ordre.append(id)
+        }
+        return ordre.map { id in
+            ManualNetwork(providerId: id, entry: providerIndex[id], lines: lignes(de: id))
+        }
+    }
+
+    private func lignes(de providerId: Int) -> [ManualLine] {
+        let sesLignes = lines.filter { $0.providerId == providerId }
+        let sesArrets = stops.filter { $0.providerId == providerId }
+
+        var ordre: [String?] = []
+        var vus = Set<String>()
+        for nom in sesLignes.map({ Optional($0.name) }) + sesArrets.map(\.lineName)
+        where vus.insert(nom ?? "").inserted {
+            ordre.append(nom)
+        }
+
+        return ordre.map { nom in
+            let arretsDeLaLigne = sesArrets.filter { $0.lineName == nom }
+            return ManualLine(providerId: providerId,
+                              name: nom,
+                              entry: sesLignes.first { $0.name == nom },
+                              reference: Self.reference(nom, parmi: arretsDeLaLigne, chez: providerId),
+                              stops: Self.parArret(arretsDeLaLigne))
+        }
+    }
+
+    /// La ligne du référentiel, quand elle y figure.
+    ///
+    /// Une ligne peut n'exister ici que par les arrêts qui la citent, sans
+    /// qu'on ait eu à la nommer — mais ces arrêts gardent le numéro de course,
+    /// ce qui suffit à la retrouver, et à lui rendre ses couleurs.
+    private static func reference(_ nom: String?, parmi reports: [StopReport], chez providerId: Int) -> NavigoLineInfo? {
+        guard let nom else { return nil }
+        for report in reports {
+            guard let route = report.routeNumber,
+                  let ligne = NavigoLines.find(providerId, route, report.mode) else { continue }
+            // Le repli sur `line_id >> 8` peut rendre une autre ligne du même
+            // exploitant : on ne garde que celle qui porte bien ce nom.
+            if ligne.name == nom { return ligne }
+        }
+        return nil
+    }
+
+    /// Un même arrêt physique porte souvent plusieurs codes — un par quai, par
+    /// sens, ou par exploitant qui le dessert — et ces codes n'ont aucune raison
+    /// de se ressembler. Ils se rangent sous le nom qu'on leur a donné.
+    private static func parArret(_ reports: [StopReport]) -> [ManualStop] {
+        var ordre: [String] = []
+        var groupes: [String: [StopReport]] = [:]
+        for report in reports {
+            if groupes[report.stationName] == nil { ordre.append(report.stationName) }
+            groupes[report.stationName, default: []].append(report)
+        }
+        return ordre.map { ManualStop(name: $0, reports: groupes[$0] ?? []) }
+    }
+
+    // MARK: Écriture
+
+    /// Un même arrêt ne se signale qu'une fois : le dernier avis remplace.
+    /// Une saisie en remplace une autre quand elle désigne la même chose. Sur
+    /// un bus ou un tram, il y faut la même course : le même code y nomme deux
+    /// arrêts distincts sur deux lignes, et les ranger ensemble revenait à
+    /// effacer le premier en nommant le second.
+    func save(_ report: StopReport) {
+        stops.removeAll { $0.providerId == report.providerId
+                       && $0.locationId == report.locationId
+                       && $0.mode == report.mode
+                       && (!NavigoStations.numeroteParLigne(report.mode)
+                           || Self.memeCourse($0.routeNumber, report.routeNumber,
+                                              report.providerId, report.mode)) }
+        stops.insert(report, at: 0)
+        rebuild()
+        persistStops()
+    }
+
+    func save(_ entry: LineEntry) {
+        lines.removeAll { $0.providerId == entry.providerId
+                       && $0.routeNumber == entry.routeNumber
+                       && $0.mode == entry.mode }
+        lines.insert(entry, at: 0)
+        rebuild()
+        persistLines()
+    }
+
+    func save(_ entry: ProviderEntry) {
+        providers.removeAll { $0.providerId == entry.providerId }
+        providers.insert(entry, at: 0)
+        rebuild()
+        persistProviders()
+    }
+
+    func rename(stop id: UUID, to name: String) {
+        guard let i = stops.firstIndex(where: { $0.id == id }) else { return }
+        stops[i].stationName = name
+        rebuild()
+        persistStops()
+    }
+
+    func rename(line id: UUID, to name: String) {
+        guard let i = lines.firstIndex(where: { $0.id == id }) else { return }
+        lines[i].name = name
+        rebuild()
+        persistLines()
+    }
+
+    func delete(stop id: UUID) {
+        stops.removeAll { $0.id == id }
+        rebuild()
+        persistStops()
+    }
+
+    func delete(line id: UUID) {
+        lines.removeAll { $0.id == id }
+        rebuild()
+        persistLines()
+    }
+
+    func delete(provider id: UUID) {
+        providers.removeAll { $0.id == id }
+        rebuild()
+        persistProviders()
+    }
+
+    func clearStops() {
+        stops = []
+        rebuild()
+        Persistance.effacer(stopsURL)
+        stopsEcrasables = true
+    }
+
+    func clearLines() {
+        lines = []
+        rebuild()
+        Persistance.effacer(linesURL)
+        linesEcrasables = true
+    }
+
+    func clearProviders() {
+        providers = []
+        rebuild()
+        Persistance.effacer(providersURL)
+        providersEcrasables = true
+    }
+
+    func clearIgnoredStops() {
+        ignoredStops = []
+        rebuild()
+        Persistance.effacer(ignoredStopsURL)
+        ignoredStopsEcrasables = true
+    }
+
+    func clearAll() {
+        clearStops()
+        clearLines()
+        clearProviders()
+        clearIgnoredStops()
+    }
+
+    /// Écarte l'arrêt d'une validation, et d'elle seule.
+    func ignoreStop(of eventInfo: [String: Any]) {
+        guard let cle = CleValidation(eventInfo), !ignoredIndex.contains(cle) else { return }
+        ignoredStops.insert(IgnoredStop(id: UUID(), date: Date(), validation: cle), at: 0)
+        rebuild()
+        persistIgnoredStops()
+    }
+
+    func restoreStop(of eventInfo: [String: Any]) {
+        guard let cle = CleValidation(eventInfo) else { return }
+        ignoredStops.removeAll { $0.validation == cle }
+        rebuild()
+        persistIgnoredStops()
+    }
+
+    // MARK: Export
+
+    var isEmpty: Bool { providers.isEmpty && lines.isEmpty && stops.isEmpty }
+
+    /// Le journal complet. Chaque tableau garde la forme à plat que le script
+    /// de génération attend ; ils sont seulement réunis sous leur nature, pour
+    /// que tout parte en un seul fichier.
+    var export: Data? {
+        try? JSONEncoder.iso.encode(ManualExport(reseaux: providers, lignes: lines, arrets: stops))
+    }
+
+    private struct ManualExport: Encodable {
+        let reseaux: [ProviderEntry]
+        let lignes: [LineEntry]
+        let arrets: [StopReport]
+    }
+
+    // MARK: Persistance
+
+    private func rebuild() {
+        stopIndex = Dictionary(grouping: stops) {
+            Self.stopKey($0.providerId, $0.locationId, $0.mode)
+        }
+        lineIndex = Dictionary(lines.map { (Self.lineKey($0.providerId, $0.routeNumber, $0.mode), $0) },
+                               uniquingKeysWith: { first, _ in first })
+        providerIndex = Dictionary(providers.map { ($0.providerId, $0) },
+                                   uniquingKeysWith: { first, _ in first })
+        ignoredIndex = Set(ignoredStops.map(\.validation))
+        revision += 1
+    }
+
+    private func persistStops() {
+        if stopsEcrasables { Persistance.ecrire(stops, vers: stopsURL, encodeur: .iso) }
+    }
+
+    private func persistLines() {
+        if linesEcrasables { Persistance.ecrire(lines, vers: linesURL, encodeur: .iso) }
+    }
+
+    private func persistProviders() {
+        if providersEcrasables { Persistance.ecrire(providers, vers: providersURL, encodeur: .iso) }
+    }
+
+    private func persistIgnoredStops() {
+        if ignoredStopsEcrasables { Persistance.ecrire(ignoredStops, vers: ignoredStopsURL, encodeur: .iso) }
+    }
+}
+
+
+// MARK: - L'arborescence
+
+struct ManualNetwork: Identifiable {
+    let providerId: Int
+    /// La saisie qui a nommé ce réseau, s'il en a fallu une.
+    let entry: ProviderEntry?
+    let lines: [ManualLine]
+
+    var id: Int { providerId }
+    var stopCount: Int { lines.reduce(0) { $0 + $1.stopCount } }
+}
+
+struct ManualLine: Identifiable {
+    let providerId: Int
+    /// Nil quand les arrêts ont été relevés sans ligne connue.
+    let name: String?
+    /// La saisie qui a nommé cette ligne, s'il en a fallu une.
+    let entry: LineEntry?
+    /// La ligne du référentiel, quand elle y figure.
+    let reference: NavigoLineInfo?
+    let stops: [ManualStop]
+
+    var id: String { "\(providerId)|\(name ?? "")" }
+    var stopCount: Int { stops.count }
+
+    /// Le mode de la ligne, pour lui trouver son indice : celui de la saisie, du
+    /// référentiel, ou à défaut des arrêts relevés.
+    var mode: String? {
+        entry?.mode ?? reference?.mode ?? stops.first?.reports.first?.mode
+    }
+    var codeCount: Int { stops.reduce(0) { $0 + $1.reports.count } }
+
+    // Les couleurs de la saisie d'abord — elle n'existe que là où le
+    // référentiel n'a rien —, puis celles du référentiel, puis le gris qui dit
+    // qu'on ne sait pas.
+    var backgroundColor: String {
+        entry?.backgroundColor ?? reference?.background_color ?? LineEntry.defaultBackground
+    }
+
+    var textColor: String {
+        entry?.textColor ?? reference?.text_color ?? LineEntry.defaultText
+    }
+}
+
+struct ManualStop: Identifiable {
+    let name: String
+    /// Tous les codes qui désignent cet arrêt.
+    let reports: [StopReport]
+
+    var id: String { name }
+}
+
+
+// MARK: - Codage
+
+extension JSONEncoder {
+    static var iso: JSONEncoder {
+        let e = JSONEncoder()
+        e.dateEncodingStrategy = .iso8601
+        e.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        return e
+    }
+}
+
+extension JSONDecoder {
+    static var iso: JSONDecoder {
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        return d
+    }
+}
+
+
+extension String {
+    var trimmed: String { trimmingCharacters(in: .whitespacesAndNewlines) }
+    var nilIfEmpty: String? { isEmpty ? nil : self }
+}
+
+
+/// Le journal partagé depuis Réglages › Données.
+struct ManualEntriesFile: Transferable {
+    let data: Data
+    let fileName: String
+
+    static var transferRepresentation: some TransferRepresentation {
+        DataRepresentation(exportedContentType: .json) { $0.data }
+            .suggestedFileName { $0.fileName }
+    }
+}
+
+
+extension ProviderEntry: LibelleExploitant {}

@@ -1,0 +1,100 @@
+//
+//  ImagePickerSheet.swift
+//  TransportReader
+//
+//  Created by Antoine Souben-Fink on 04/01/2026.
+//
+
+import SwiftUI
+
+
+struct ImagePickerSheet: View {
+    @Environment(\.dismiss) var dismiss
+    let cardID: UInt64
+    @ObservedObject var historyManager: HistoryManager
+    
+    // Catégories et ordre d'affichage : Data/PassCategories.json
+    let categories: [PassCategory] = PassCatalog.categories
+
+    let columns = [GridItem(.flexible()), GridItem(.flexible())]
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 25) {
+                    
+                    // --- SECTION AUTOMATIQUE ---
+                    Section {
+                        Button {
+                            historyManager.setImageName(for: cardID, to: "")
+                            dismiss()
+                        } label: {
+                            VStack {
+                                ZStack {
+                                    RoundedRectangle(cornerRadius: 10)
+                                        .fill(Color.secondary.opacity(0.1))
+                                    Image(systemName: "arrow.counterclockwise")
+                                        .font(.largeTitle)
+                                        .foregroundColor(.secondary)
+                                }
+                                .frame(height: 100)
+                                Text("Automatique").font(.caption).bold()
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .frame(width: 158) // Aligné sur la taille de la grille
+                    }
+                    
+                    // --- PARCOURS DES CATÉGORIES ---
+                    
+                    ForEach(categories) { category in
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(category.displayName)
+                                .font(.title3)
+                                .bold()
+                                .padding(.bottom, 5)
+
+                            LazyVGrid(columns: columns, spacing: 20) {
+                                ForEach(category.images, id: \.self) { imgName in
+                                    Button {
+                                        historyManager.setImageName(for: cardID, to: imgName)
+                                        dismiss()
+                                    } label: {
+                                        VStack {
+                                            NavigoImage(imageName: imgName)
+                                                .frame(height: 100)
+                                                .cornerRadius(10)
+                                                .shadow(color: .black.opacity(0.1), radius: 3)
+                                            
+                                            Text(imgName)
+                                                .font(.caption)
+                                                .lineLimit(1)
+                                                .minimumScaleFactor(0.8)
+                                        }
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding()
+            }
+            .navigationTitle("Choisir une image")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Fermer") { dismiss() }
+                }
+            }
+            #else
+            .toolbar {
+                ToolbarItem {
+                    Button("Fermer") { dismiss() }
+                }
+            }
+            #endif
+        }
+    }
+}

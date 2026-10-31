@@ -1,0 +1,11 @@
+import Foundation
+var labels = RegionalCodeLabels()
+labels.set("  Gare connue  ", network: 1, field: "place", code: 29)
+precondition(labels.label(network: 1, field: "place", code: 29) == "Gare connue")
+precondition(labels.label(network: 2, field: "place", code: 29) == nil)
+precondition(labels.label(network: 1, field: "eventProvider", code: 29) == nil)
+precondition(RegionalCodeLabels(json: labels.json) == labels)
+labels.set(" \n ", network: 1, field: "place", code: 29)
+precondition(labels.label(network: 1, field: "place", code: 29) == nil)
+precondition(RegionalCodeLabels(json: "invalid") == RegionalCodeLabels())
+print("Local code labels: network/field isolation, persistence, trimming and deletion passed")
